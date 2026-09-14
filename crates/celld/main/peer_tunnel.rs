@@ -694,23 +694,51 @@ where
             // The client went away; the owner sees EOF through the tunnel
             // and runs its own close dispatch.
         }
-        _ = tokio::io::copy(&mut inner_read, &mut client_write) => {
+        owner_closed = copy_to_client(&mut inner_read, &mut client_write) => {
             // The owner side ended. A clean close frame already crossed as
-            // bytes; an abnormal end left the client mid-conversation, so
-            // tell it the service restarted — the same 1012 the enveloped
-            // tunnel sent. After a clean close the client has already shut
-            // its state machine and ignores this frame.
-            let client = client_read.unsplit(client_write);
-            let mut ws = fastwebsockets::WebSocket::after_handshake(
-                client,
-                fastwebsockets::Role::Server,
-            );
-            let _ = ws
-                .write_frame(fastwebsockets::Frame::close(1012, b"owner unavailable"))
-                .await;
+            // bytes and the client has shut its state machine; a second
+            // Close after it is a protocol error the browser reports rather
+            // than ignores. An abnormal end left the client mid-conversation,
+            // so tell it the service restarted — the same 1012 the enveloped
+            // tunnel sent.
+            if !owner_closed {
+                let client = client_read.unsplit(client_write);
+                let mut ws = fastwebsockets::WebSocket::after_handshake(
+                    client,
+                    fastwebsockets::Role::Server,
+                );
+                let _ = ws
+                    .write_frame(fastwebsockets::Frame::close(1012, b"owner unavailable"))
+                    .await;
+            }
         }
     }
     Ok(())
+}
+
+/// Copy owner bytes to the client until the owner side ends, and report
+/// whether a complete Close frame crossed on the way.
+async fn copy_to_client<R, W>(owner: &mut R, client: &mut W) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut scanner = celld_logic::schedule::WebSocketCloseScanner::default();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = match owner.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        scanner.observe(&buffer[..read]);
+        if client.write_all(&buffer[..read]).await.is_err() {
+            break;
+        }
+    }
+    let _ = client.flush().await;
+    scanner.close_seen()
 }
 
 type TunnelBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
